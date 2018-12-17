@@ -494,35 +494,34 @@ class BaseDataConstructor(threading.Thread):
     tf.logging.info("Epoch construction complete. Time: {:.1f} seconds".format(
         timeit.default_timer() - start_time))
 
-  def _get_eval_batch(self, i):
-    """Construct a single batch of evaluation data.
+  @staticmethod
+  def _assemble_eval_batch(users, positive_items, negative_items,
+                           users_per_batch):
+    """Construct duplicate_mask and structure data accordingly.
+
+    The positive items should be last so that they lose ties. However, they
+    should not be masked out if the true eval positive happens to be
+    selected as a negative. So instead, the positive is placed in the first
+    position, and then switched with the last element after the duplicate
+    mask has been computed.
 
     Args:
-      i: The index of the batch.
+      users: An array of users in a batch. (should be identical along axis 1)
+      positive_items: An array (batch_size x 1) of positive item indices.
+      negative_items: An array of negative item indices.
+      users_per_batch: How many users should be in the batch. This is passed
+        as an argument so that ncf_test.py can use this method.
+
+    Returns:
+      User, item, and duplicate_mask arrays.
     """
-    low_index = i * self._eval_users_per_batch
-    high_index = (i + 1) * self._eval_users_per_batch
-
-    users = np.repeat(self._eval_pos_users[low_index:high_index, np.newaxis],
-                      1 + rconst.NUM_EVAL_NEGATIVES, axis=1)
-
-    # Ordering:
-    #   The positive items should be last so that they lose ties. However, they
-    #   should not be masked out if the true eval positive happens to be
-    #   selected as a negative. So instead, the positive is placed in the first
-    #   position, and then switched with the last element after the duplicate
-    #   mask has been computed.
-    items = np.concatenate([
-        self._eval_pos_items[low_index:high_index, np.newaxis],
-        self.lookup_negative_items(negative_users=users[:, :-1].flatten())
-        .reshape(-1, rconst.NUM_EVAL_NEGATIVES),
-    ], axis=1)
+    items = np.concatenate([positive_items, negative_items], axis=1)
 
     # We pad the users and items here so that the duplicate mask calculation
     # will include the padding. The metric function relies on every element
     # except the positive being marked as duplicate to mask out padded points.
-    if users.shape[0] < self._eval_users_per_batch:
-      pad_rows = self._eval_users_per_batch - users.shape[0]
+    if users.shape[0] < users_per_batch:
+      pad_rows = users_per_batch - users.shape[0]
       padding = np.zeros(shape=(pad_rows, users.shape[1]), dtype=np.int32)
       users = np.concatenate([users, padding.astype(users.dtype)], axis=0)
       items = np.concatenate([items, padding.astype(items.dtype)], axis=0)
@@ -533,6 +532,24 @@ class BaseDataConstructor(threading.Thread):
     duplicate_mask[:, (0, -1)] = duplicate_mask[:, (-1, 0)]
 
     assert users.shape == items.shape == duplicate_mask.shape
+    return users, items, duplicate_mask
+
+  def _get_eval_batch(self, i):
+    """Construct a single batch of evaluation data.
+
+    Args:
+      i: The index of the batch.
+    """
+    low_index = i * self._eval_users_per_batch
+    high_index = (i + 1) * self._eval_users_per_batch
+    users = np.repeat(self._eval_pos_users[low_index:high_index, np.newaxis],
+                      1 + rconst.NUM_EVAL_NEGATIVES, axis=1)
+    positive_items = self._eval_pos_items[low_index:high_index, np.newaxis]
+    negative_items = (self.lookup_negative_items(negative_users=users[:, -1])
+                      .reshape(-1, rconst.NUM_EVAL_NEGATIVES))
+
+    users, items, duplicate_mask = self._assemble_eval_batch(
+        users, positive_items, negative_items, self._eval_users_per_batch)
 
     self._eval_dataset.put(i, {
         movielens.USER_COLUMN: users.flatten(),
